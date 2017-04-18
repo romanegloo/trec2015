@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 examples of running on docker container
 
@@ -10,7 +9,6 @@ examples of running on docker container
 from __future__ import print_function
 
 import os
-import sys
 import copy
 import shutil
 import glob
@@ -20,12 +18,10 @@ from nltk.stem.porter import *
 import string
 import argparse
 import pickle
-import logging  # default levels [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+import logging
 from collections import Counter
 import subprocess
 import datetime
-from pymetamap import MetaMap
-
 
 dt = datetime.datetime.now().strftime("%m%d-%I%M")
 data_path = '../data/TREC/2015/'
@@ -82,6 +78,7 @@ TERRIER = {  # information relevant to Terrier system
     'matching_model': 'BM25',
     'enable_qe': True,  # enable default system query expansion
 }
+
 """
 available matching models:
 (from http://terrier.org/docs/v4.2/configure_retrieval.html)
@@ -103,14 +100,14 @@ def _xml2simple(file, pool_dir):
     xpath_terms = {
         'TITLE': '//front//article-title',
         'ABSTRACT': '//abstract',
-        'KEYWORDS': 'kwd-group',
+        'KEYWORDS': '//kwd-group',
         'BODY': '//body',
         'REF': '//back//article-title'
     }
 
     try:
         doc_from = et.parse(file)
-    except:
+    except et.XMLSyntaxError as e:
         logging.warning("unable to parse document file [{}]".format(file))
         return 1
 
@@ -209,6 +206,7 @@ def _run_parse_query(conf=CONF_QUERY):
     logging.info("start/ parsing queries")
 
     if conf['enable-cui-expansion']:
+        from pymetamap import MetaMap
         mm = MetaMap.get_instance('/opt/public_mm/bin/metamap')
 
     stopwords = None
@@ -527,6 +525,196 @@ def _run_test_27():
     _run_terrier_evaluate()
 
 
+def _run_test_28():
+    """run and evaluate with document class scores"""
+    score_file = TERRIER['dir_var'] + '/results/scores.pkl'
+    res_file = TERRIER['dir_var'] + \
+               '/results/BM25b0.75_Bo1bfree_d_5_t_20_0.res'
+    if os.path.exists(score_file):
+        with open(score_file, 'rb') as f:
+            scores = pickle.load(f)
+    else:
+        pmidx_file = '/root/projects/TREC/utils/cnnclf/data/pm.idx'
+
+        if not os.path.exists(res_file):
+            raise SystemError("res file does not eixsts. [{}]".format(res_file))
+        if not os.path.exists(pmidx_file):
+            raise SystemError("pm index file does not eixsts. [{}]".
+                              format(pmidx_file))
+
+        # construct scores
+        scores = dict()
+        # scores = {
+        #   '1-2799065': {
+        #       'q_no':         '1',
+        #       'pmcid':        '2799065',
+        #       'pmid':         '17242961',
+        #       'raw_score':    110.3309697896708,
+        #       'file_path':    '/root/projects/TREC/data/TREC/2015/pmc-text-01/36',
+        #       'snippet':      'concatenated text of the title and abstract'
+        #       'qt_loss':      0.781734314
+        #   }
+
+        # read res file
+        pmcids = []
+        with open(res_file) as f:
+            for line in f:
+                t = line.split()
+                # if t[0] not in ['1', '2']:
+                #     continue
+                scores[t[0]+'-'+t[2]] = {
+                    'q_no': t[0],
+                    'pmcid': t[2],
+                    'raw_score': float(t[4])
+                }
+                pmcids.append(t[2])
+
+        # load file_path
+        paths = {}
+        with open(pmidx_file) as f:
+            for line in f:
+                t = line.split()
+                id = t[1].split('.')[0]
+                paths[id] = t
+        logging.info("reading and parsing document")
+        cnt = 0
+        for k, res in scores.items():  # length: 30000
+            id = res['pmcid']
+            print("reading {} [{} / {}]\r".format(id, cnt, len(scores)), end='')
+            cnt += 1
+            # fill in file_path and pmid
+            res['file_path'] = paths[id][0]
+            res['pmid'] = paths[id][2]
+            # read doc file and fill in snippet
+            file_doc = os.path.join(res['file_path'], paths[id][1])
+            if os.path.exists(file_doc):
+                try:
+                    doc_xml = et.parse(file_doc)
+                except et.XMLSyntaxError as e:
+                    logging.warning("unable to parse document file [{}]".
+                                    format(file_doc))
+                xpath_terms = {
+                    'TITLE': '//front//article-title',
+                    'ABSTRACT': '//abstract',
+                    'KEYWORDS': '//kwd-group'
+                }
+                snippet = ''
+                for tag, path in xpath_terms.items():
+                    elms = doc_xml.xpath(path)
+                    for e in elms:
+                        snippet += ''.join([x for x in e.itertext()])
+                res['snippet'] = snippet
+        del paths
+
+        # restore tensorflow model
+        import tensorflow as tf
+        from cnnclf.model import MeshCNN
+        import cnnclf.data_prep as dp
+        # CNN setup
+        sequence_len = 58  # max number of sentences in a document
+        embedding_dim = 200  # word embedding size (using pre-trained word2vec)
+        filter_sizes = "3,4,5"        # comma-separated filter sizes
+        num_filters = 128             # number of filters per filter size
+        l2_reg_lambda = 0.0           # l2 regularization lambda (optional)
+        model_path = './cnnclf/runs/1491937785/checkpoints/model-1844000'
+        file_w2v = './cnnclf/data/PMC-w2v.bin'
+
+        with tf.Graph().as_default():
+            # define a session
+            session_conf = tf.ConfigProto(allow_soft_placement=True)
+            sess = tf.Session(config=session_conf)
+            with sess.as_default():
+                # instantiate MeshCNN model
+                cnn = MeshCNN(
+                    sequence_length=sequence_len,
+                    num_classes=4,
+                    embedding_size=embedding_dim,
+                    filter_sizes=list(map(int, filter_sizes.split(','))),
+                    num_filters=num_filters,
+                    l2_reg_lambda=l2_reg_lambda
+                )
+                cnn.inference()
+                cnn.loss_accuracy()
+
+                # restore session with checkpoint data
+                if not os.path.exists(model_path + '.meta'):
+                    SystemError("checkpoint path does not exist [{}]".
+                                format(model_path))
+
+                print("=== restoring a model ===")
+                # Initialize all variables
+                sess.run(tf.global_variables_initializer())
+                saver = tf.train.Saver(tf.global_variables())
+                saver.restore(sess, model_path)
+                print("model restored [{}]".format(model_path))
+
+                # for each document run classifier and get doc type scores
+                for k, res in scores.items():
+                    emb = dp.sent_embedding(file_w2v, res['snippet'],
+                                            sequence_len, embedding_dim)
+
+                    if int(res['q_no']) < 11:
+                        y = [1, 0, 0, 0]
+                    elif int(res['q_no']) < 21:
+                        y = [0, 1, 0, 0]
+                    elif int(res['q_no']) < 31:
+                        y = [0, 0, 1, 0]
+                    else:  # this doesn't happen
+                        y = [0, 0, 0, 0]
+
+                    score, loss = sess.run([cnn.scores, cnn.loss],
+                                     {cnn.input_x: [emb],
+                                      cnn.input_y: [y],
+                                      cnn.dropout_keep_prob: 1.0})
+                    res['qt_loss'] = loss
+        with open(score_file, 'wb') as f:
+            pickle.dump(scores, f, pickle.HIGHEST_PROTOCOL)
+
+    # write the results
+    weights = [0, 0.05, 1, 2]
+    with open(res_file) as f:
+        for w in weights:
+            f.seek(0)
+            new_rank = [[] for x in range(30)]  # 30 topics
+            print(w)
+            for line in f:
+                t = line.split()
+                # if t[0] not in ['1', '2']:
+                #     continue
+                # 1 Q0 2799065 0 110.3309697896708 In_expC2c1.0_Bo1bfree_d_10_t_50
+                # compute new score
+                try:
+                    new_score = float(t[4]) + \
+                                w / float(scores[t[0]+'-'+t[2]]['qt_loss'])
+                except ZeroDivisionError:
+                    new_score = float(t[4])
+
+                new_line = (t[2], new_score, t[5])
+                new_rank[int(t[0])-1].append(list(new_line))
+
+            # rerank
+            for i, q in enumerate(new_rank):
+                new_rank[i] = sorted(q, key=lambda r: r[1], reverse=True)
+
+            # write a new res file
+            newres = TERRIER['dir_var'] + '/results/w' + str(w) + '.res'
+            with open(newres, 'w') as f_nr:
+                for qi, q in enumerate(new_rank):
+                    for li, l in enumerate(q):
+                        f_nr.write("{} Q0 {} {} {} {}\n".\
+                                   format(qi+1, l[0], li, l[1], l[2]))
+            # run evaluation
+            print("evaluating with new res file")
+            cmd = ['./sample_eval.pl', CONF['file_qrel_inf'], newres]
+            run = subprocess.run(cmd,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+            metrics = ['infAP', 'infNDCG']
+            for l in run.stdout.decode('utf-8').splitlines():
+                if any(w in l for w in metrics):
+                    logging.info(l)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("command", help="run different subtasks",
@@ -555,9 +743,9 @@ if __name__ == '__main__':
         _run_terrier_retrieve()
     elif args.command == 'evaluate':
         _run_terrier_evaluate(interactive=True)
-    elif args.command == 'test':
-        _run_test_27()
     elif args.command == 'terrier_setup':
         _run_terrier_setup()
     elif args.command == 'terrier_index':
         _run_terrier_index()
+    elif args.command == 'test':
+        _run_test_28()
